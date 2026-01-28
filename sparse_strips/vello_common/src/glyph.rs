@@ -20,7 +20,6 @@ use skrifa::{
 };
 
 use crate::colr::convert_bounding_box;
-use crate::encode::x_y_advances;
 use crate::kurbo::Rect;
 use crate::pixmap::Pixmap;
 use skrifa::bitmap::{BitmapData, BitmapFormat, BitmapStrikes, Origin};
@@ -425,53 +424,33 @@ fn prepare_colr_glyph<'a>(
     // that the bounding box of the glyph starts at (0, 0), then we draw the whole glyph, and
     // finally when positioning the actual pixmap in the scene, we reverse that transform so that
     // the position stays the same as the original one.
+    //
+    // The font_scale converts from font units to the glyph's natural pixel size at the
+    // requested font_size. The scene transform (run_transform) is applied separately when
+    // positioning the rendered pixmap, ensuring scale/rotation/skew are applied exactly once.
 
-    let scale = font_size / upem;
+    let font_scale = f64::from(font_size / upem);
 
-    let transform = run_transform.pre_translate(Vec2::new(glyph.x.into(), glyph.y.into()));
-
-    // Estimate the size of the intermediate pixmap. Ideally, the intermediate bitmap should have
-    // exactly one pixel (or more) per device pixel, to ensure that no quality is lost. Therefore,
-    // we simply use the scaling/skewing factor to calculate how much to scale by, and use the
-    // maximum of both dimensions.
-    let scale_factor = {
-        let (x_vec, y_vec) = x_y_advances(&transform.pre_scale(f64::from(scale)));
-        x_vec.length().max(y_vec.length())
-    };
+    // The position transform incorporates glyph offset and will be used for final positioning.
+    let position_transform = run_transform.pre_translate(Vec2::new(glyph.x.into(), glyph.y.into()));
 
     let bbox = color_glyph
         .bounding_box(LocationRef::default(), Size::unscaled())
         .map(convert_bounding_box)
         .unwrap_or(Rect::new(0.0, 0.0, f64::from(upem), f64::from(upem)));
 
-    // Calculate the position of the rectangle that will contain the rendered pixmap in device
-    // coordinates.
-    let scaled_bbox = bbox.scale_from_origin(scale_factor);
+    // Scale the bounding box by font_scale only (not scene transform).
+    // This gives us the glyph's natural size at the requested font_size.
+    let scaled_bbox = bbox.scale_from_origin(font_scale);
 
-    // Remove the scale component from the transform while preserving rotation, skew, and translation.
-    // The scale is already baked into scaled_bbox dimensions, so applying transform's scale
-    // again would cause double-scaling.
-    //
-    // We decompose the matrix to extract scale factors from the basis vectors, then reconstruct
-    // the matrix with unit-length basis vectors (preserving rotation/skew but removing scale).
-    let [a, b, c, d, tx, ty] = transform.as_coeffs();
+    let (pix_width, pix_height) = (
+        scaled_bbox.width().ceil() as u16,
+        scaled_bbox.height().ceil() as u16,
+    );
 
-    // Calculate scale factors from the lengths of the basis vectors
-    let sx = (a * a + b * b).sqrt();
-    let sy = (c * c + d * d).sqrt();
-
-    // Reconstruct transform without scale (divide basis vectors by their lengths)
-    // This preserves rotation and skew while removing scale
-    let transform_without_scale = Affine::new([
-        a / sx,
-        b / sx,
-        c / sy,
-        d / sy,
-        tx,
-        ty,
-    ]);
-
-    let glyph_transform = transform_without_scale
+    // glyph_transform: Maps from the pixmap's coordinate space to device coordinates.
+    // Applies the full scene transform (position_transform).
+    let glyph_transform = position_transform
         // There are two things going on here:
         // - On the one hand, for images, the position (0, 0) will be at the top-left, while
         //   for images, the position will be at the bottom-left.
@@ -486,17 +465,12 @@ fn prepare_colr_glyph<'a>(
         // of where the glyph should be placed.
         * Affine::translate((scaled_bbox.x0, scaled_bbox.y0));
 
-    let (pix_width, pix_height) = (
-        scaled_bbox.width().ceil() as u16,
-        scaled_bbox.height().ceil() as u16,
-    );
-
     let draw_transform =
         // Shift everything so that the bbox starts at (0, 0) and the whole visible area of
         // the glyph will be contained in the intermediate pixmap.
         Affine::translate((-scaled_bbox.x0, -scaled_bbox.y0)) *
-        // Scale down to the actual size that the COLR glyph will have in device units.
-        Affine::scale(scale_factor);
+        // Scale from font units to the glyph's natural pixel size.
+        Affine::scale(font_scale);
 
     // The shift-back happens in `glyph_transform`, so here we can assume (0.0, 0.0) as the origin
     // of the area we want to draw to.
